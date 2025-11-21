@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+pyvmomi
+sqlalchemy
+pandas
+rapidfuzz
+keyring
+openpyxl
+cryptography
+pydantic
+python-multipart
+aiofiles
+pymssql
+psycopg2-binary
+APScheduler
+python-dotenv
+PyJWT

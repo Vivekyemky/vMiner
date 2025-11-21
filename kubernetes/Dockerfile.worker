@@ -1,0 +1,34 @@
+# Dockerfile for vMiner Sync Worker
+
+FROM python:3.12-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY backend/ ./backend/
+COPY utils/ ./utils/
+COPY config/ ./config/
+COPY workers/ ./workers/
+
+# Create non-root user
+RUN useradd -m -u 1000 vminer && \
+    chown -R vminer:vminer /app
+
+USER vminer
+
+# Run sync worker
+CMD ["python", "workers/sync_worker.py"]

@@ -1,0 +1,537 @@
+# Kubernetes Deployment for vMiner Hyper-Scale
+# This deploys the complete vMiner stack on Kubernetes
+
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vminer
+  labels:
+    name: vminer
+    environment: production
+
+---
+# ConfigMap for application configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vminer-config
+  namespace: vminer
+data:
+  SYNC_INTERVAL_MINUTES: "60"
+  REDIS_PORT: "6379"
+  RABBITMQ_PORT: "5672"
+  API_WORKERS: "16"
+  SYNC_WORKERS_PER_INSTANCE: "10"
+  LOG_LEVEL: "INFO"
+
+---
+# Secret for sensitive data (base64 encoded)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vminer-secrets
+  namespace: vminer
+type: Opaque
+data:
+  # Replace these with actual base64 encoded values
+  # echo -n 'your-password' | base64
+  DB_PASSWORD: cGFzc3dvcmQxMjM=
+  SECRET_KEY: c3VwZXItc2VjcmV0LWtleS0xMjM=
+  REDIS_PASSWORD: cmVkaXMtcGFzc3dvcmQtMTIz
+  RABBITMQ_PASSWORD: cmFiYml0bXEtcGFzc3dvcmQtMTIz
+
+---
+# PostgreSQL StatefulSet (for development/testing)
+# In production, use managed service like AWS RDS or Cloud SQL
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: vminer
+spec:
+  serviceName: postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+    spec:
+      containers:
+      - name: postgresql
+        image: postgres:15
+        ports:
+        - containerPort: 5432
+          name: postgresql
+        env:
+        - name: POSTGRES_DB
+          value: vminer
+        - name: POSTGRES_USER
+          value: vminer_app
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: vminer-secrets
+              key: DB_PASSWORD
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        volumeMounts:
+        - name: postgresql-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "8Gi"
+            cpu: "4"
+          limits:
+            memory: "16Gi"
+            cpu: "8"
+  volumeClaimTemplates:
+  - metadata:
+      name: postgresql-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: "fast-ssd"
+      resources:
+        requests:
+          storage: 500Gi
+
+---
+# PostgreSQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: vminer
+spec:
+  selector:
+    app: postgresql
+  ports:
+  - port: 5432
+    targetPort: 5432
+  clusterIP: None
+
+---
+# Redis StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: vminer
+spec:
+  serviceName: redis
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command:
+        - redis-server
+        - --requirepass
+        - $(REDIS_PASSWORD)
+        - --maxmemory
+        - "30gb"
+        - --maxmemory-policy
+        - allkeys-lru
+        ports:
+        - containerPort: 6379
+          name: redis
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: vminer-secrets
+              key: REDIS_PASSWORD
+        resources:
+          requests:
+            memory: "32Gi"
+            cpu: "4"
+          limits:
+            memory: "32Gi"
+            cpu: "8"
+        volumeMounts:
+        - name: redis-storage
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: redis-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 50Gi
+
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: vminer
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+
+---
+# RabbitMQ StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: vminer
+spec:
+  serviceName: rabbitmq
+  replicas: 3
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3-management
+        ports:
+        - containerPort: 5672
+          name: amqp
+        - containerPort: 15672
+          name: management
+        env:
+        - name: RABBITMQ_DEFAULT_USER
+          value: vminer
+        - name: RABBITMQ_DEFAULT_PASS
+          valueFrom:
+            secretKeyRef:
+              name: vminer-secrets
+              key: RABBITMQ_PASSWORD
+        - name: RABBITMQ_DEFAULT_VHOST
+          value: vminer
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        volumeMounts:
+        - name: rabbitmq-storage
+          mountPath: /var/lib/rabbitmq
+  volumeClaimTemplates:
+  - metadata:
+      name: rabbitmq-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 50Gi
+
+---
+# RabbitMQ Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: vminer
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+  - port: 5672
+    targetPort: 5672
+    name: amqp
+  - port: 15672
+    targetPort: 15672
+    name: management
+
+---
+# API Server Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vminer-api
+  namespace: vminer
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: vminer-api
+  template:
+    metadata:
+      labels:
+        app: vminer-api
+    spec:
+      containers:
+      - name: api
+        image: vminer/api:latest  # Replace with your image
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: PRIMARY_DATABASE_URL
+          value: postgresql://vminer_app:$(DB_PASSWORD)@postgresql:5432/vminer
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: vminer-secrets
+              key: DB_PASSWORD
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: vminer-secrets
+              key: SECRET_KEY
+        - name: REDIS_HOST
+          value: redis
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: vminer-secrets
+              key: REDIS_PASSWORD
+        - name: RABBITMQ_HOST
+          value: rabbitmq
+        - name: RABBITMQ_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: vminer-secrets
+              key: RABBITMQ_PASSWORD
+        envFrom:
+        - configMapRef:
+            name: vminer-config
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+---
+# API Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: vminer-api
+  namespace: vminer
+spec:
+  selector:
+    app: vminer-api
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP
+
+---
+# Sync Worker Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vminer-sync-worker
+  namespace: vminer
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: vminer-sync-worker
+  template:
+    metadata:
+      labels:
+        app: vminer-sync-worker
+    spec:
+      containers:
+      - name: sync-worker
+        image: vminer/sync-worker:latest  # Replace with your image
+        env:
+        - name: PRIMARY_DATABASE_URL
+          value: postgresql://vminer_app:$(DB_PASSWORD)@postgresql:5432/vminer
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: vminer-secrets
+              key: DB_PASSWORD
+        - name: RABBITMQ_HOST
+          value: rabbitmq
+        - name: RABBITMQ_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: vminer-secrets
+              key: RABBITMQ_PASSWORD
+        - name: WORKER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        envFrom:
+        - configMapRef:
+            name: vminer-config
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+
+---
+# Horizontal Pod Autoscaler for API
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vminer-api-hpa
+  namespace: vminer
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vminer-api
+  minReplicas: 5
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# Horizontal Pod Autoscaler for Sync Workers
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vminer-sync-worker-hpa
+  namespace: vminer
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vminer-sync-worker
+  minReplicas: 10
+  maxReplicas: 30
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+---
+# Ingress (using NGINX Ingress Controller)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vminer-ingress
+  namespace: vminer
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+spec:
+  tls:
+  - hosts:
+    - vminer.yourdomain.com
+    secretName: vminer-tls
+  rules:
+  - host: vminer.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: vminer-api
+            port:
+              number: 80
+
+---
+# PodDisruptionBudget for API
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vminer-api-pdb
+  namespace: vminer
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: vminer-api
+
+---
+# NetworkPolicy (optional, for security)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vminer-network-policy
+  namespace: vminer
+spec:
+  podSelector:
+    matchLabels:
+      app: vminer-api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgresql
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to:
+    - podSelector:
+        matchLabels:
+          app: rabbitmq
+    ports:
+    - protocol: TCP
+      port: 5672
