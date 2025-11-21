@@ -79,7 +79,10 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup on shutdown."""
     if sync_scheduler:
-        sync_scheduler.stop()
+        try:
+            sync_scheduler.stop()
+        except Exception as e:
+            logger.warning(f"Scheduler stop failed (may not be running): {e}")
     logger.info("Application shutdown")
 
 # Pydantic models
